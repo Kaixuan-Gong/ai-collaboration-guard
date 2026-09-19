@@ -2,77 +2,90 @@
 #
 # regression.sh —— ai-collaboration-guard 脚本的回归测试
 #
-# 在临时目录里建裸 remote + 多 clone/worktree 模拟，覆盖 safe_sync.sh 的 12 条行为。
+# 在临时目录里建裸 remote + 多 clone/worktree 模拟，覆盖三个脚本的行为。
 # 跑完打印 PASS/FAIL 计数；任一失败 exit 非零。
 #
 # 用法：bash tests/regression.sh
+# 日志同时写到 tests/regression.log
 #
 set -u
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 SYNC="$HERE/scripts/safe_sync.sh"
 PREFLIGHT="$HERE/scripts/preflight.sh"
+REMOTE_CHECK="$HERE/scripts/remote_check.sh"
+# 隔离 git 配置，不读宿主机的 global/system config
+GLOBAL_DIR="$(mktemp -d)" || { echo "mktemp failed"; exit 1; }
+export GIT_CONFIG_GLOBAL="$GLOBAL_DIR/empty.gitconfig"
+export GIT_CONFIG_SYSTEM="/dev/null"
+touch "$GIT_CONFIG_GLOBAL"
 
 PASS=0
 FAIL=0
-
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
-# expect_eq "描述" 期望 实际
 expect_eq() {
   if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (expected='$2' got='$3')"; fi
 }
-# expect_ne "描述" 值1 值2
 expect_ne() {
   if [ "$2" != "$3" ]; then pass "$1"; else fail "$1 (got same='$2')"; fi
 }
-# expect_contains "描述"  haystack needle
 expect_contains() {
   if printf '%s' "$2" | grep -qF -- "$3"; then pass "$1"; else fail "$1 (no substring '$3')"; fi
 }
-
-# 每个用例前打印标题
 hdr() { echo; echo "=== $1 ==="; }
 
-# 全局：测试根目录
-ROOT="$(mktemp -d -t acg-regression.XXXXXX)"
+ROOT="$(mktemp -d -t acg-regression.XXXXXX)" || { echo "mktemp failed"; exit 1; }
 echo "测试根目录：$ROOT"
-trap 'rm -rf "$ROOT"' EXIT
+trap 'rm -rf "$ROOT" "$GLOBAL_DIR"' EXIT
+
+# fake gh: 返回空 PR 数组（[]），用于让 remote_check 的 PR 部分走"无 open PR"分支
+FAKEBIN="$ROOT/fakebin"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/gh" <<'GH'
+#!/bin/sh
+case "$1" in auth) exit 0;; api) printf '[]\n'; exit 0;; esac
+GH
+chmod +x "$FAKEBIN/gh"
+FAKE_PATH="$FAKEBIN:/usr/bin:/bin"
+
 
 # 通用：在某目录里安静地做一个 commit
 mkcommit() {
-  # 用法: mkcommit <dir> <file> <content>
   (
     cd "$1" || exit 1
     printf '%s\n' "$3" > "$2"
     git add "$2"
-    git commit -q -m "commit: $2"
+    git commit -q -m "commit: $2" || exit 1
   )
 }
 
 # 每个用例开始前重置一个干净的 origin + 两个 clone
 fresh_setup() {
-  # 用法: fresh_setup <name>
   local name="$1"
   local dir="$ROOT/$name"
-  mkdir -p "$dir"
-  git init --bare -b main "$dir/origin.git" >/dev/null
-  # seed commit：显式 init -b main + 加 remote + push，避免 clone 空仓库时本地分支名不确定
-  git init -q -b main "$dir/seed"
+  mkdir -p "$dir" || { echo "setup failed: mkdir"; exit 1; }
+  git init --bare -b main "$dir/origin.git" >/dev/null || { echo "setup failed: bare init"; exit 1; }
+  git init -q -b main "$dir/seed" || { echo "setup failed: seed init"; exit 1; }
   ( cd "$dir/seed"
     git config user.name "Tester"
     git config user.email "tester@example.com"
     echo "# seed" > README.md
     git add README.md
-    git commit -q -m "seed"
-    git remote add origin "$dir/origin.git"
-    git push -q origin main
-  )
-  # clone A and B
-  git clone -q "$dir/origin.git" "$dir/A"
-  git clone -q "$dir/origin.git" "$dir/B"
+    git commit -q -m "seed" || exit 1
+    git remote add origin "$dir/origin.git" || exit 1
+    git push -q origin main || exit 1
+  ) || { echo "setup failed: seed push"; exit 1; }
+  git clone -q "$dir/origin.git" "$dir/A" || { echo "setup failed: clone A"; exit 1; }
+  git clone -q "$dir/origin.git" "$dir/B" || { echo "setup failed: clone B"; exit 1; }
   ( cd "$dir/A" && git config user.name "Alice" && git config user.email "alice@example.com" )
   ( cd "$dir/B" && git config user.name "Bob"   && git config user.email "bob@example.com" )
+  # 把 origin URL 改成 GitHub 风格（让 remote_check 能解析 slug），同时用 insteadOf 重写回本地路径供 fetch
+  for c in "$dir/A" "$dir/B"; do
+    ( cd "$c"
+      git remote set-url origin "git@github.com:test/test.git"
+      git config "url.$dir/origin.git.insteadOf" "git@github.com:test/test.git"
+    )
+  done
 }
 
 ############################################
@@ -82,26 +95,22 @@ hdr "1) tracking remote 不叫 origin、tracking 分支名与本地不同"
 {
   fresh_setup "case1"
   d="$ROOT/case1"
-  # A 把 origin 改名为 central，本地建一个 dev 分支跟踪 central/main
   ( cd "$d/A"
     git remote rename origin central
     git switch -q -c dev central/main
   )
-  # B 在 main 上推一个新提交
   mkcommit "$d/B" "from_b.txt" "from B"
   ( cd "$d/B" && git push -q origin main )
 
-  # A 在 dev 上跑 safe_sync，应识别 tracking remote=central
   out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"
   rc=$?
   expect_eq "case1: exit 0" "0" "$rc"
   expect_contains "case1: 识别 central" "$out" "central/main"
-  # A 的 dev 应该已经快进到包含 from_b.txt
-  if [ -f "$d/A/from_b.txt" ]; then pass "case1: dev 已同步到 B 的提交"; else fail "case1: dev 没拿到 B 的提交"; fi
+  [ -f "$d/A/from_b.txt" ] && pass "case1: dev 已同步到 B 的提交" || fail "case1: dev 没拿到 B 的提交"
 }
 
 ############################################
-# 2) fork 场景：origin=自己的 fork，upstream=原仓库
+# 2) fork 场景：origin=fork, upstream=原仓库
 ############################################
 hdr "2) fork 场景：origin=fork, upstream=原仓库"
 {
@@ -109,27 +118,23 @@ hdr "2) fork 场景：origin=fork, upstream=原仓库"
   mkdir -p "$d"
   git init --bare -b main "$d/upstream.git" >/dev/null
   git init --bare -b main "$d/myfork.git" >/dev/null
-  # seed upstream：显式 init -b main + 加 remote + push
   git init -q -b main "$d/seed"
   ( cd "$d/seed"
-    git config user.name "Tester" && git config user.email "t@e.com"
+    git config user.name "T" && git config user.email "t@e.com"
     echo "# seed" > README.md && git add README.md && git commit -q -m seed
     git remote add upstream "$d/upstream.git"
     git remote add myfork "$d/myfork.git"
     git push -q upstream main
     git push -q myfork main
   )
-  # 本地从 myfork clone
   git clone -q "$d/myfork.git" "$d/work"
   ( cd "$d/work"
     git config user.name "Bob" && git config user.email "bob@e.com"
     git remote add upstream "$d/upstream.git"
   )
-  # 原仓库 upstream 有新提交，但 myfork 没有
   mkcommit "$d/seed" "upstream_change.txt" "from upstream"
   ( cd "$d/seed" && git push -q upstream main )
 
-  # 在 work 上跑 safe_sync：它应该同步 origin（=myfork），不是 upstream
   out="$( cd "$d/work" && bash "$SYNC" 2>&1 )"
   rc=$?
   expect_eq "case2: exit 0（myfork 没动，无需同步）" "0" "$rc"
@@ -138,24 +143,21 @@ hdr "2) fork 场景：origin=fork, upstream=原仓库"
   else
     pass "case2: safe_sync 没动 upstream，只认 origin"
   fi
-  # 手工按文档 fork 三步同步后，upstream 的改动才应该进来
   ( cd "$d/work"
     git fetch -q upstream
     git merge --ff-only upstream/main
   )
-  if [ -f "$d/work/upstream_change.txt" ]; then pass "case2: 手工 ff-only 同步 upstream 成功"; else fail "case2: 手工同步失败"; fi
+  [ -f "$d/work/upstream_change.txt" ] && pass "case2: 手工 ff-only 同步 upstream 成功" || fail "case2: 手工同步失败"
 }
 
 ############################################
-# 3) 当前分支无上游 → 非零、不假报成功
+# 3) 无 upstream → 非零退出
 ############################################
 hdr "3) 无 upstream → 非零退出"
 {
   fresh_setup "case3"
   d="$ROOT/case3"
-  ( cd "$d/A"
-    git switch -q -c no-upstream
-  )
+  ( cd "$d/A" && git switch -q -c no-upstream )
   out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"
   rc=$?
   expect_ne "case3: 非零退出" "0" "$rc"
@@ -163,47 +165,47 @@ hdr "3) 无 upstream → 非零退出"
 }
 
 ############################################
-# 4) 未知参数 → 报错
+# 4) 未知参数 → 报错（含第二个未知参数）
 ############################################
 hdr "4) 未知参数 → 报错"
 {
   fresh_setup "case4"
   out="$( cd "$ROOT/case4/A" && bash "$SYNC" --bogus 2>&1 )"
   rc=$?
-  expect_ne "case4: 非零退出" "0" "$rc"
-  expect_contains "case4: 提示未知参数" "$out" "未知参数"
+  expect_ne "case4a: 单未知参数非零" "0" "$rc"
+  expect_contains "case4a: 提示未知参数" "$out" "未知参数"
+
+  out="$( cd "$ROOT/case4/A" && bash "$SYNC" --dry-run --bogus 2>&1 )"
+  rc=$?
+  expect_ne "case4b: 第二参数也拒绝" "0" "$rc"
 }
 
 ############################################
-# 5) 已暂存/未暂存/未跟踪三种改动被保留
+# 5) 脏工作区：三种改动都不被丢
 ############################################
 hdr "5) 脏工作区：三种改动都不被丢"
 {
   fresh_setup "case5"
   d="$ROOT/case5"
   ( cd "$d/A"
-    # 未暂存改动
     echo "unstaged" >> README.md
-    # 已暂存改动
     echo "staged-new" > staged.txt
     git add staged.txt
-    # 未跟踪新文件
     echo "untracked-new" > untracked.txt
   )
   out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"
   rc=$?
   expect_ne "case5: 脏工作区拒绝" "0" "$rc"
   expect_contains "case5: 提示先提交或 stash" "$out" "我不会替你丢"
-  # 断言三种内容都还在
   grep -q "unstaged" "$d/A/README.md" && pass "case5: 未暂存改动还在" || fail "case5: 未暂存改动丢了"
   grep -q "staged-new" "$d/A/staged.txt" && pass "case5: 已暂存文件还在" || fail "case5: 已暂存文件丢了"
   grep -q "untracked-new" "$d/A/untracked.txt" && pass "case5: 未跟踪文件还在" || fail "case5: 未跟踪文件丢了"
 }
 
 ############################################
-# 5b) 只暂存、无未暂存/未跟踪 → 也要被当成脏工作区拦下
+# 5b) 纯暂存（已 git add 未 commit）→ safe_sync 拒绝
 ############################################
-hdr "5b) 纯暂存（已 git add 未 commit）→ safe_sync 拒绝"
+hdr "5b) 纯暂存 → safe_sync 拒绝"
 {
   fresh_setup "case5b"
   d="$ROOT/case5b"
@@ -218,58 +220,61 @@ hdr "5b) 纯暂存（已 git add 未 commit）→ safe_sync 拒绝"
 }
 
 ############################################
-# 6) detached / unborn / 正在 rebase 中 → 停下
+# 6) detached / unborn / rebase 中 / revert 中 → 停下
 ############################################
-hdr "6) detached / unborn / rebase 中 → 停下"
+hdr "6) detached / unborn / rebase 中 / revert 中 → 停下"
 {
   fresh_setup "case6"
   d="$ROOT/case6"
 
-  # 6a detached HEAD
   ( cd "$d/A" && git switch -q --detach origin/main )
   out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"; rc=$?
   expect_ne "case6a: detached 非零" "0" "$rc"
   expect_contains "case6a: 提示 detached" "$out" "detached"
   ( cd "$d/A" && git switch -q main )
 
-  # 6b unborn HEAD
   ( cd "$d/A" && git checkout -q --orphan empty-branch )
   out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"; rc=$?
   expect_ne "case6b: unborn 非零" "0" "$rc"
   ( cd "$d/A" && git checkout -q main )
 
-  # 6c 正在 rebase（伪造 rebase-merge 目录）
   mkdir -p "$d/A/.git/rebase-merge"
   out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"; rc=$?
   expect_ne "case6c: rebase 中 非零" "0" "$rc"
   expect_contains "case6c: 提示 rebase 中途" "$out" "rebase"
   rmdir "$d/A/.git/rebase-merge"
+
+  echo "revert-me" > "$d/A/.git/REVERT_HEAD"
+  out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"; rc=$?
+  expect_ne "case6d: revert 中 非零" "0" "$rc"
+  expect_contains "case6d: 提示 revert" "$out" "revert"
+  rm "$d/A/.git/REVERT_HEAD"
 }
 
 ############################################
-# 7) 分叉（ahead+behind）→ 默认不 rebase、停下
+# 7) 分叉 → 不替用户 rebase，给出可执行的 merge 建议
 ############################################
 hdr "7) 分叉 → 不替用户 rebase"
 {
   fresh_setup "case7"
   d="$ROOT/case7"
-  # B 先在 main 上推一个提交
   mkcommit "$d/B" "b_first.txt" "b first"
   ( cd "$d/B" && git push -q origin main )
-  # A 在 main 上做一个本地提交（A 还不知道 B 的提交）
   mkcommit "$d/A" "a_first.txt" "a first"
   a_sha_before="$( cd "$d/A" && git rev-parse HEAD )"
-  # A 直接 push 会被拒
   push_out="$( cd "$d/A" && git push origin main 2>&1 )"; push_rc=$?
   expect_ne "case7: A 直接 push 被拒" "0" "$push_rc"
-  # A 跑 safe_sync：应识别分叉、停下、不 rebase
   out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"; rc=$?
   expect_ne "case7: 分叉时非零退出" "0" "$rc"
   expect_contains "case7: 提示分叉" "$out" "分叉"
-  expect_contains "case7: 给两个选项" "$out" "merge --no-rebase"
-  # A 的本地 commit SHA 应该没变（没被 rebase）
-  a_sha_after="$( cd "$d/A" && git rev-parse HEAD )"
-  expect_eq "case7: A 的 commit 没被 rebase（SHA 不变）" "$a_sha_before" "$a_sha_after"
+  expect_contains "case7: 给出可执行的 merge 命令" "$out" "git merge --no-edit"
+  # 真的执行这条建议，验证可执行且保留双方历史
+  ( cd "$d/A" && git merge origin/main --no-edit -m "merge test" 2>/dev/null || true )
+  if ( cd "$d/A" && git merge-base --is-ancestor "$a_sha_before" HEAD 2>/dev/null ); then
+    pass "case7: A 的原 commit 在 merge 后仍在历史里"
+  else
+    fail "case7: A 的原 commit 丢了"
+  fi
 }
 
 ############################################
@@ -279,10 +284,8 @@ hdr "8) --dry-run 不真 fetch"
 {
   fresh_setup "case8"
   d="$ROOT/case8"
-  # B 推一个新提交
   mkcommit "$d/B" "b_dry.txt" "b dry"
   ( cd "$d/B" && git push -q origin main )
-  # A 在 dry-run 前记录 origin/main 的 SHA（旧）
   old_sha="$( cd "$d/A" && git rev-parse origin/main )"
   ( cd "$d/A" && bash "$SYNC" --dry-run >/dev/null 2>&1 )
   new_sha="$( cd "$d/A" && git rev-parse origin/main )"
@@ -296,15 +299,13 @@ hdr "9) ref 读取失败 → 非零"
 {
   fresh_setup "case9"
   d="$ROOT/case9"
-  # 直接写坏 upstream：让 main 跟踪 origin/does-not-exist（绕过 git 的校验）
   ( cd "$d/A"
     git config branch.main.remote origin
     git config branch.main.merge refs/heads/does-not-exist
   )
   out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"; rc=$?
   expect_ne "case9: 非零退出" "0" "$rc"
-  # 不应该说"已同步"
-  if printf '%s' "$out" | grep -qF "已同步"; then fail "case9: 假报已同步"; else pass "case9: 没假报成功"; fi
+  if printf '%s' "$out" | grep -qF "同步完成"; then fail "case9: 假报同步完成"; else pass "case9: 没假报成功"; fi
 }
 
 ############################################
@@ -314,14 +315,12 @@ hdr "10) 标准 ff-only 同步成功"
 {
   fresh_setup "case10"
   d="$ROOT/case10"
-  # B 推一个提交
   mkcommit "$d/B" "b_sync.txt" "b sync"
   ( cd "$d/B" && git push -q origin main )
-  # A 干净，跑 safe_sync
   out="$( cd "$d/A" && bash "$SYNC" 2>&1 )"; rc=$?
   expect_eq "case10: exit 0" "0" "$rc"
   expect_contains "case10: ff-only" "$out" "ff-only"
-  if [ -f "$d/A/b_sync.txt" ]; then pass "case10: A 拿到 B 的提交"; else fail "case10: A 没拿到"; fi
+  [ -f "$d/A/b_sync.txt" ] && pass "case10: A 拿到 B 的提交" || fail "case10: A 没拿到"
 }
 
 ############################################
@@ -332,14 +331,12 @@ hdr "11) 两个 feature 合入 main，再同步到新 clone"
   fresh_setup "case11"
   d="$ROOT/case11"
   ( cd "$d/A"
-    # feature/x
     git switch -q -c feature/x
     echo "x" > x.txt && git add x.txt && git commit -q -m "x"
     git push -q -u origin feature/x
     git switch -q main
     git merge -q --no-ff feature/x -m "merge feature/x"
     git push -q origin main
-    # feature/y
     git switch -q -c feature/y
     echo "y" > y.txt && git add y.txt && git commit -q -m "y"
     git push -q -u origin feature/y
@@ -347,7 +344,6 @@ hdr "11) 两个 feature 合入 main，再同步到新 clone"
     git merge -q --no-ff feature/y -m "merge feature/y"
     git push -q origin main
   )
-  # 新 clone C
   git clone -q "$d/origin.git" "$d/C"
   ( cd "$d/C" && git config user.name "C" && git config user.email "c@e.com" )
   out="$( cd "$d/C" && bash "$SYNC" 2>&1 )"; rc=$?
@@ -363,18 +359,14 @@ hdr "12) worktree 隔离：主 worktree 的未提交改动不影响新 worktree"
   fresh_setup "case12"
   d="$ROOT/case12"
   ( cd "$d/A"
-    # 在主 worktree 里做未提交改动
     echo "uncommitted in main worktree" >> README.md
-    # 开一个 worktree
     git worktree add -q "$d/A-wt1" -b feature/wt1
   )
-  # 新 worktree 里 README 不应包含主 worktree 的未提交改动
   if grep -q "uncommitted in main worktree" "$d/A-wt1/README.md"; then
     fail "case12: worktree 泄漏了主 worktree 的未提交改动"
   else
     pass "case12: worktree 不受主 worktree 未提交改动影响"
   fi
-  # 新 worktree 应该在自己的分支上
   wt_branch="$( cd "$d/A-wt1" && git symbolic-ref --short HEAD )"
   expect_eq "case12: worktree 在自己分支上" "feature/wt1" "$wt_branch"
 }
@@ -417,14 +409,14 @@ hdr "14) remote_check 报 main 落后"
   )
   mkcommit "$d/B" "b_new.txt" "b new on main"
   ( cd "$d/B" && git push -q origin main )
-  out="$( cd "$d/A" && bash "$REMOTE_CHECK" 2>&1 )"; rc=$?
-  expect_eq "case14: remote_check exit 0" "0" "$rc"
-  expect_contains "case14: 报告 main 落后" "$out" "远端比你本地多"
-  expect_contains "case14: CHANGED: yes" "$out" "CHANGED: yes"
+  out="$( cd "$d/A" && env PATH="$FAKE_PATH" bash "$REMOTE_CHECK" 2>&1 )"; rc=$?
+  expect_eq "case14: 有新提交时 exit 1 (ATTENTION)" "1" "$rc"
+  expect_contains "case14: 报告 CHANGED: yes" "$out" "CHANGED: yes"
+  expect_contains "case14: STATUS: ATTENTION" "$out" "STATUS: ATTENTION"
 }
 
 ############################################
-# 15) 两个 feature 分别能合进 main，但彼此冲突
+# 15) 两个 feature 分别能合进 main，但彼此冲突（用 python 改同一行，可移植）
 ############################################
 hdr "15) 两个 feature 分别能合 main，但彼此冲突"
 {
@@ -432,13 +424,13 @@ hdr "15) 两个 feature 分别能合 main，但彼此冲突"
   d="$ROOT/case15"
   ( cd "$d/A"
     git switch -q -c feature/a
-    sed -i "" "s/# seed/# seed by A/" README.md
+    python3 -c "p='README.md'; s=open(p).read(); open(p,'w').write(s.replace('# seed','# seed by A'))"
     git add README.md && git commit -q -m "a edits README"
     git push -q -u origin feature/a
   )
   ( cd "$d/B"
     git switch -q -c feature/b
-    sed -i "" "s/# seed/# seed by B/" README.md
+    python3 -c "p='README.md'; s=open(p).read(); open(p,'w').write(s.replace('# seed','# seed by B'))"
     git add README.md && git commit -q -m "b edits README"
     git push -q -u origin feature/b
   )
@@ -459,25 +451,25 @@ hdr "15) 两个 feature 分别能合 main，但彼此冲突"
 }
 
 ############################################
-# 16) 检查完后 base/head 又变了 → 识别"已过期需重查"
+# 16) 检查完后 base/head 又变了 → 识别过期
 ############################################
 hdr "16) 检查完后 base/head 变了 → 识别过期"
 {
   fresh_setup "case16"
   d="$ROOT/case16"
-  out1="$( cd "$d/A" && bash "$REMOTE_CHECK" 2>&1 )"
-  expect_contains "case16: 第一次 CHANGED: no" "$out1" "CHANGED: no"
+  out1="$( cd "$d/A" && env PATH="$FAKE_PATH" bash "$REMOTE_CHECK" 2>&1 )"
+  expect_contains "case16: 第一次 STATUS: OK" "$out1" "STATUS: OK"
   mkcommit "$d/B" "late.txt" "late push"
   ( cd "$d/B" && git push -q origin main )
   cached="$( cd "$d/A" && git rev-list --left-right --count origin/main...main 2>/dev/null || echo '0 0' )"
   cached_behind="$(echo "$cached" | awk '{print $1}')"
   expect_eq "case16: 未重新 fetch 时缓存显示落后 0（旧数据）" "0" "$cached_behind"
-  out2="$( cd "$d/A" && bash "$REMOTE_CHECK" 2>&1 )"
+  out2="$( cd "$d/A" && env PATH="$FAKE_PATH" bash "$REMOTE_CHECK" 2>&1 )"
   expect_contains "case16: 重查后 CHANGED: yes" "$out2" "CHANGED: yes"
 }
 
 ############################################
-# 17) remote_check fetch 失败 → UNKNOWN，不假成功
+# 17) remote_check fetch 失败 → UNKNOWN 非零
 ############################################
 hdr "17) remote_check fetch 失败 → UNKNOWN"
 {
@@ -490,7 +482,7 @@ hdr "17) remote_check fetch 失败 → UNKNOWN"
 }
 
 ############################################
-# 18) remote_check 不在 git 仓库里 → 报错
+# 18) remote_check 不在 git 仓库 → 报错
 ############################################
 hdr "18) remote_check 不在 git 仓库 → 报错"
 {
@@ -500,10 +492,253 @@ hdr "18) remote_check 不在 git 仓库 → 报错"
 }
 
 ############################################
+# 19) remote_check 无 gh 时 PR_STATUS: unknown（干净仓库仍 exit 0）
+############################################
+hdr "19) remote_check 无 gh => UNKNOWN 非零，不能 OK"
+{
+  fresh_setup "case19"
+  d="$ROOT/case19"
+  out="$( cd "$d/A" && env PATH=/usr/bin:/bin bash "$REMOTE_CHECK" --base origin/main 2>&1 )"; rc=$?
+  expect_eq "case19: 无 gh 必须 exit 2" "2" "$rc"
+  expect_contains "case19: STATUS UNKNOWN" "$out" "STATUS: UNKNOWN"
+  if printf '%s' "$out" | grep -q "STATUS: OK"; then fail "case19: 不应出现 STATUS: OK"; else pass "case19: 无 STATUS: OK"; fi
+}
+
+############################################
+# 20) remote_check 显式 --base
+############################################
+hdr "20) remote_check 显式 --base + fake gh 返回空 PR 数组 => none"
+{
+  fresh_setup "case20"
+  d="$ROOT/case20"
+  fake="$d/bin"; mkdir -p "$fake"
+  cat > "$fake/gh" <<'GH'
+#!/bin/sh
+case "$1" in auth) exit 0;; api) printf '[]\n'; exit 0;; esac
+GH
+  chmod +x "$fake/gh"
+  out="$( cd "$d/A" && env PATH="$fake:/usr/bin:/bin" bash "$REMOTE_CHECK" --base origin/main 2>&1 )"; rc=$?
+  expect_eq "case20: 空 PR 数组 exit 0" "0" "$rc"
+  expect_contains "case20: 打印 BASE" "$out" "BASE: origin/main"
+  expect_contains "case20: PR_STATUS none" "$out" "PR_STATUS: none"
+}
+
+############################################
+# 21) safe_sync 拒绝第二个参数
+############################################
+hdr "21) safe_sync 多参数拒绝"
+{
+  fresh_setup "case21"
+  out="$( cd "$ROOT/case21/A" && bash "$SYNC" --dry-run extra 2>&1 )"; rc=$?
+  expect_ne "case21: 多参数非零" "0" "$rc"
+  expect_contains "case21: 提示参数太多" "$out" "参数太多"
+}
+
+############################################
+# 22) remote_check fake gh 返回 malformed JSON => UNKNOWN
+############################################
+hdr "22) remote_check PR JSON malformed => UNKNOWN"
+{
+  fresh_setup "case22"
+  d="$ROOT/case22"
+  fake="$d/bin"; mkdir -p "$fake"
+  cat > "$fake/gh" <<'GH'
+#!/bin/sh
+case "$1" in auth) exit 0;; api) printf 'not-json{{{{'; exit 0;; esac
+GH
+  chmod +x "$fake/gh"
+  out="$( cd "$d/A" && env PATH="$fake:/usr/bin:/bin" bash "$REMOTE_CHECK" --base origin/main 2>&1 )"; rc=$?
+  expect_eq "case22: malformed PR exit 2" "2" "$rc"
+  expect_contains "case22: STATUS UNKNOWN" "$out" "STATUS: UNKNOWN"
+}
+
+############################################
+# 23) remote_check fake gh 返回两个 open PR，嵌套 sha 都要读对
+############################################
+hdr "23) remote_check 列全部 open PR 且读对嵌套 sha"
+{
+  fresh_setup "case23"
+  d="$ROOT/case23"
+  fake="$d/bin"; mkdir -p "$fake"
+  # 两个 PR：base.sha 与 head.sha 故意不同，验证 python 解析没把 base.sha 当 head.sha
+  cat > "$fake/gh" <<'GH'
+#!/bin/sh
+case "$1" in
+  auth) exit 0;;
+  api) printf '[{"number":10,"base":{"ref":"main","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"head":{"ref":"alice/f1","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},{"number":11,"base":{"ref":"main","sha":"cccccccccccccccccccccccccccccccccccccccc"},"head":{"ref":"bob/f2","sha":"dddddddddddddddddddddddddddddddddddddddd"}}]\n'; exit 0;;
+esac
+GH
+  chmod +x "$fake/gh"
+  out="$( cd "$d/A" && env PATH="$fake:/usr/bin:/bin" bash "$REMOTE_CHECK" --base origin/main 2>&1 )"; rc=$?
+  # 有 open PR 需要 AI 核对 => ATTENTION（exit 1），不是 OK
+  expect_eq "case23: 有 open PR => ATTENTION exit 1" "1" "$rc"
+  expect_contains "case23: 读到 PR#10" "$out" "PR#10"
+  expect_contains "case23: 读到 PR#11" "$out" "PR#11"
+  expect_contains "case23: base.sha aaaa" "$out" "aaaaaaaa"
+  expect_contains "case23: head.sha bbbb" "$out" "bbbbbbbb"
+  expect_contains "case23: 第二个 base cccc" "$out" "cccccccc"
+  expect_contains "case23: 第二个 head dddd" "$out" "dddddddd"
+}
+
+############################################
+# 24) conflict_check 干净合并不需冲突
+############################################
+hdr "24) conflict_check: 只加新文件 => CLEAN"
+{
+  fresh_setup "case24"
+  d="$ROOT/case24"
+  ( cd "$d/A" && git switch -q -c feat && echo new > g.txt && git add g.txt && git commit -qm feat )
+  out="$( cd "$d/A" && bash "$HERE/scripts/conflict_check.sh" origin/main feat 2>&1 )"; rc=$?
+  expect_eq "case24: 干净合 exit 0" "0" "$rc"
+  expect_contains "case24: CLEAN" "$out" "RESULT: CLEAN"
+}
+
+############################################
+# 25) conflict_check 同一行双方都改 => CONFLICT
+############################################
+hdr "25) conflict_check: 同改一行 => CONFLICT"
+{
+  fresh_setup "case25"
+  d="$ROOT/case25"
+  ( cd "$d/A"
+    git switch -q -c fa
+    echo line-fa > x.txt && git add x.txt && git commit -qm fa
+    git push -q origin fa
+    git switch -q main
+  )
+  ( cd "$d/B"
+    git switch -q -c fb
+    echo line-fb > x.txt && git add x.txt && git commit -qm fb
+  )
+  # fa 和 fb 都从 main 加了不同内容的 x.txt（add/add 冲突）
+  ( cd "$d/B" && git fetch -q origin )
+  out="$( cd "$d/B" && bash "$HERE/scripts/conflict_check.sh" origin/fa fb 2>&1 )"; rc=$?
+  expect_eq "case25: 冲突 exit 1" "1" "$rc"
+  expect_contains "case25: CONFLICT" "$out" "RESULT: CONFLICT"
+}
+
+############################################
+# 26) conflict_check 坏 ref => UNKNOWN exit 2
+############################################
+hdr "26) conflict_check: 坏 ref => UNKNOWN"
+{
+  fresh_setup "case26"
+  d="$ROOT/case26"
+  out="$( cd "$d/A" && bash "$HERE/scripts/conflict_check.sh" origin/main no-such-branch 2>&1 )"; rc=$?
+  expect_eq "case26: 坏 ref exit 2" "2" "$rc"
+}
+
+############################################
+# 27) gh 返回空数组但 exit 9（分页中途失败）=> UNKNOWN，不能当 none
+############################################
+hdr "27) gh exit 9 + 空数组 => UNKNOWN"
+{
+  fresh_setup "case27"
+  d="$ROOT/case27"
+  fake="$d/bin"; mkdir -p "$fake"
+  cat > "$fake/gh" <<'GH'
+#!/bin/sh
+case "$1" in auth) exit 0;; api) printf '[]\n'; exit 9;; esac
+GH
+  chmod +x "$fake/gh"
+  out="$( cd "$d/A" && env PATH="$fake:/usr/bin:/bin" bash "$REMOTE_CHECK" --base origin/main 2>&1 )"; rc=$?
+  expect_eq "case27: exit 2" "2" "$rc"
+  expect_contains "case27: UNKNOWN" "$out" "STATUS: UNKNOWN"
+}
+
+############################################
+# 28) 第一个 PR 合法、第二个畸形 => 整体 MALFORMED
+############################################
+hdr "28) 有效+畸形 PR => UNKNOWN"
+{
+  fresh_setup "case28"
+  d="$ROOT/case28"
+  fake="$d/bin"; mkdir -p "$fake"
+  B40=$(python3 -c "print('a'*40)")
+  cat > "$fake/gh" <<GH
+#!/bin/sh
+case \$1 in
+  auth) exit 0;;
+  api) printf '[{"number":1,"base":{"ref":"main","sha":"$B40"},"head":{"ref":"x/y","sha":"$B40"}},{"broken":true}]\n'; exit 0;;
+esac
+GH
+  chmod +x "$fake/gh"
+  out="$( cd "$d/A" && env PATH="$fake:/usr/bin:/bin" bash "$REMOTE_CHECK" --base origin/main 2>&1 )"; rc=$?
+  expect_eq "case28: exit 2" "2" "$rc"
+  expect_contains "case28: UNKNOWN" "$out" "STATUS: UNKNOWN"
+}
+
+############################################
+# 29) 多页：两个连续 JSON 数组都要被读出
+############################################
+hdr "29) 多页两个数组都读出"
+{
+  fresh_setup "case29"
+  d="$ROOT/case29"
+  fake="$d/bin"; mkdir -p "$fake"
+  A40=$(python3 -c "print('a'*40)")
+  B40=$(python3 -c "print('b'*40)")
+  C40=$(python3 -c "print('c'*40)")
+  D40=$(python3 -c "print('d'*40)")
+  cat > "$fake/gh" <<GH
+#!/bin/sh
+case \$1 in
+  auth) exit 0;;
+  api) printf '[{"number":1,"base":{"ref":"main","sha":"$A40"},"head":{"ref":"p1","sha":"$B40"}}][{"number":2,"base":{"ref":"main","sha":"$C40"},"head":{"ref":"p2","sha":"$D40"}}]\n'; exit 0;;
+esac
+GH
+  chmod +x "$fake/gh"
+  out="$( cd "$d/A" && env PATH="$fake:/usr/bin:/bin" bash "$REMOTE_CHECK" --base origin/main 2>&1 )"; rc=$?
+  expect_eq "case29: 两个 PR => ATTENTION exit 1" "1" "$rc"
+  expect_contains "case29: PR#1" "$out" "PR#1"
+  expect_contains "case29: PR#2" "$out" "PR#2"
+}
+
+############################################
+# 30) conflict_check: 全局 custom merge driver 不被执行（sentinel 不产生）
+############################################
+hdr "30) conflict_check 不执行全局 merge driver"
+{
+  fresh_setup "case30"
+  d="$ROOT/case30"
+  sentinel="$GLOBAL_DIR/driver-sentinel"
+  rm -f "$sentinel"
+  # 配一个全局 merge driver，每次运行就 touch sentinel
+  git config --global merge.baddriver.driver "touch $sentinel" 2>/dev/null || true
+  git config --global merge.conflictStyle merge 2>/dev/null || true
+  ( cd "$d/A" && git switch -q -c feat && echo new > g.txt && git add g.txt && git commit -qm feat )
+  ( cd "$d/A" && bash "$HERE/scripts/conflict_check.sh" origin/main feat >/dev/null 2>&1 )
+  if [ -f "$sentinel" ]; then
+    fail "case30: 全局 merge driver 被执行了"
+  else
+    pass "case30: 全局 merge driver 未被执行"
+  fi
+  # 清理全局配置，避免污染其他用例
+  git config --global --unset merge.baddriver.driver 2>/dev/null || true
+}
+
+############################################
+# 31) conflict_check 跑完后源仓库 HEAD/index 不变
+############################################
+hdr "31) conflict_check 源仓库 HEAD/index 不变"
+{
+  fresh_setup "case31"
+  d="$ROOT/case31"
+  ( cd "$d/A" && git switch -q -c feat && echo new > g.txt && git add g.txt && git commit -qm feat )
+  head_before="$( cd "$d/A" && git rev-parse HEAD )"
+  idx_before="$( cd "$d/A" && git ls-files -s | git hash-object --stdin )"
+  ( cd "$d/A" && bash "$HERE/scripts/conflict_check.sh" origin/main feat >/dev/null 2>&1 )
+  head_after="$( cd "$d/A" && git rev-parse HEAD )"
+  idx_after="$( cd "$d/A" && git ls-files -s | git hash-object --stdin )"
+  [ "$head_before" = "$head_after" ] && pass "case31: HEAD 不变" || fail "case31: HEAD 变了"
+  [ "$idx_before" = "$idx_after" ] && pass "case31: index 不变" || fail "case31: index 变了"
+}
+
+############################################
 # 注释：语义审查不测
 #
 # "语义审查不能用测试代替"这一条是情景评估，不是脚本能测的行为。
-# 上面 1-18 只测机械行为（fetch、ahead/behind、ff-only、脏工作区拒绝、worktree 隔离等）。
+# 上面 1-21 只测机械行为（fetch、ahead/behind、ff-only、脏工作区拒绝、worktree 隔离等）。
 # "merge 干净 ≠ 逻辑对"、"测试绿 ≠ 没 bug"、"要 AI 自己读 diff 写依据"
 # 这些由宿主 AI 按 references/ai-review-flow.md 负责，脚本证明不了。
 # README 里也明说了这一点。

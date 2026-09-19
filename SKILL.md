@@ -19,15 +19,13 @@ description: >-
    不要默认套某个流程就开跑。
 2. **没提交的改动不许擅自丢掉。** 有未提交/未跟踪文件时，pull / 合并 / 变基 / 切分支之前，先问用户：
    "先提交还是先暂存（stash）？" 绝不允许 `checkout .`、`reset --hard`、`clean -fd` 一类静默丢弃。
-3. **默认禁止 force push。** `git push --force` / `--force-with-lease` 只在"分支只有你一个人在用、你刚推过、
-   没人已经基于它干活"时，且你已向用户解释"这会覆盖远端历史、可能让朋友的本地仓库坏掉"并得到明确同意后才能用。
-   共享分支（主分支、朋友正在用的分支）上**永远不许** force push。
+3. **默认禁止 force push。** 主线、发布线和他人依赖的分支禁止强推。仅在用户明确要求处理个人分支历史、已核实无人依赖并有备份时，另行评估；不得把强推作为同步失败的解决方案。强推可能移除远端可见历史，不会自动删除朋友本地的提交。
 4. **push 被拒绝是 Git 在保护大家，不是 bug。** 正常 push 遇到 `! [rejected] ... non-fast-forward` 时，
    意思是"远端有你还没有的新提交"。正确动作是先拉下来合并/变基再推，**绝对不是加 `--force`**。
 5. **任何破坏性操作前先说后果。** 删分支、改写历史、强推、覆盖未推送的提交之前，先一句话告诉用户会发生什么、
    影响到谁，再动手。
-6. **别谎称规则已经自动生效。** 分支保护、PR 必审、CI 必过这些只有仓库所有者在 GitHub 网页设置后才存在；
-   免费版/某些计划可能没有。能用就教用户开；用不了就如实说"目前靠你自己记得检查"，不要假称"CI 会自动拦住"。
+6. **别谎称规则已经自动生效。** 分支保护、PR 必审、CI 必过需要具备权限的维护者通过网页、CLI 或 API 配置，并回读验证。
+   先核验仓库可见性、计划、权限和已有设置；不能配置时明确仅为工作约定，不假称服务器已强制拦截。
 
 完整安全清单与反例见 [references/safety-rules.md](references/safety-rules.md)，动手前快速扫一眼。
 
@@ -48,20 +46,36 @@ description: >-
    也可以直接用 `<skill>/scripts/safe_sync.sh`（它会停下提醒你，而不是替你丢东西；默认只快进，分叉时不替你 rebase）。
 5. **推送前再查一次远端。** 推之前**重新**跑 `remote_check.sh`——你开工时看的远端状态可能已经过时（TOCTOU）。
    远端主线有新提交就先合进你的功能分支再推。
-6. **发起 PR / 合并前，做语义审查。** 这一步必须由你这个 AI 做，不能靠脚本。
-   按 [references/ai-review-flow.md](references/ai-review-flow.md) 读 diff、检查改动范围、判断逻辑/接口/数据迁移影响，
-   并写一句依据。**"合并干净"或"测试绿"不等于"没有逻辑问题"。** 有业务决策点才问用户（"这里允许跳过手机号校验，你同意吗？"）。
-7. **对方 PR 要合入前，重查最新状态。** PR 可能又有新 push，旧 approve 失效。
+6. **发起 PR / 合并前，做机械冲突预判 + 语义审查。**
+   - 机械文本冲突：跑 `"$SKILL_DIR/scripts/conflict_check.sh" "$base" "$head"`（base/head 用明确 ref 或 SHA）。
+     退出码 0=标准文本合并通过，1=会冲突，2=UNKNOWN/LIMITED（信息不足或自定义合并规则未覆盖），2 不能放行。它在隔离临时 clone 里跑，
+     不碰用户工作区、不跑仓库里的代码 / 自定义 merge driver。
+   - 语义审查**必须由你这个 AI 做，脚本证明不了**。按 [references/ai-review-flow.md](references/ai-review-flow.md) 读 diff、
+     检查改动范围、判断逻辑/接口/数据迁移影响，并写一句依据。
+     **"合并干净"或"测试绿"不等于"没有逻辑问题"。** 有业务决策点才问用户（"这里允许跳过手机号校验，你同意吗？"）。
+7. **对方 PR 要合入前，重查最新状态。** PR 可能又有新 push。
+   区分两种情况：
+   - 只有 GitHub 在分支保护里勾了 "Dismiss stale pull request approvals"，旧 approve 才会被 GitHub 强制作废；
+   - 不管 GitHub 有没有这个设置，**你这个 Skill 都要求重新读最新 diff**——你十分钟前看过的，对方可能又推了一个 commit。
    重新跑 `remote_check.sh`、重读最新 diff、看 checks/review 状态，再决定合不合。
    解决完冲突**实际跑一下代码/测试**再说"好了"，合并成功 ≠ 代码是对的。
 
 ### 诚实边界（必须对用户说清楚）
 
 - 这个 Skill **不是后台服务**，它依赖宿主 AI 实际加载和工具权限。宿主不加载 / 没权限，就什么也读不到。
-- 对方**没 push 到共享远端**的改动你**根本看不到**——这是黑盒边界，不是 bug。
+- 对方**尚未 push 到共享远端**的改动你**根本看不到**——这是黑盒边界，不是 bug。
 - 不同 AI 编程工具对"调用自定义脚本 / gh CLI"的支持本仓库未实测；gh 不可用时 PR 状态标 UNKNOWN，不要假装知道。
 - 分支保护 / PR 必审 / CI 必过这些只有仓库 owner 在 GitHub 设置后才存在；设完要回读验证（见 [references/gates-setup.md](references/gates-setup.md)）。
   没配上 / 套餐不支持，就如实说"目前靠你们自觉"。
+
+### 按需读取
+
+- 开始任何 Git 写操作或遇到异常：读 `references/safety-rules.md`。
+- 选择协作方式、接入已有项目或发布/维护版本：读 `references/scenarios.md` 对应章节。
+- 审 PR、判断对方改动、准备合并：读 `references/ai-review-flow.md`。
+- 实际配置 GitHub 规则或 CI：读 `references/gates-setup.md`。
+- 出现文本冲突：读 `references/conflict-resolution.md`。
+- Git/凭证/远端尚未配置：读 `references/setup-checklist.md`。
 
 ## 大白话提问（拿不准情景时这样问，一次最多问 2 个）
 
@@ -80,7 +94,7 @@ description: >-
 - 问"现在谁在用 AI"：
   "现在是**你一个人先用 AI 写**，还是**朋友那边也已经在用 AI 写了**？"
 
-用户答不上"协作者/fork"这种词时，翻译成"他点开 GitHub 上那个仓库，能不能直接点绿色 Code 按钮后把代码推回去"。
+用户答不上"协作者/fork"这种词时，翻译成"他在 GitHub 上能直接往这个仓库推代码吗？"——注意：网页上的绿色 "Code" 按钮只说明他能 clone，**不等于他有写权限**；要以他实际 push 成功或你看到他的分支出现在远端为准。
 **把答案记下来**，后面整个会话都用同一套流程，不要每轮重新问一遍。
 
 ## 情景速查
@@ -102,13 +116,21 @@ description: >-
 
 ## 每次开工前：预检 + 联网检查
 
+先把 `SKILL_DIR` 设为本次实际读取 `SKILL.md` 的父目录绝对路径，验证该目录的脚本存在。
+不得照抄占位符或运行用户项目内的同名脚本；每次新终端重新解析变量。
+从零且尚无 Git 仓库时先进入情景 1 的初始化引导；预检报“不在仓库”不是丢弃现有文件的理由。
+
 ```bash
-bash <skill>/scripts/preflight.sh     # 只读看本地状态
-bash <skill>/scripts/remote_check.sh  # 真联网 fetch，看远端有没有新东西
+# SKILL_DIR 必须已按上述步骤解析，未设置则停止。
+: "${SKILL_DIR:?请先解析实际 Skill 安装目录}"
+bash "$SKILL_DIR/scripts/preflight.sh"     # 只读看本地状态
+bash "$SKILL_DIR/scripts/remote_check.sh"   # 真联网 fetch，看远端有没有新东西
 ```
 
 `<skill>` 是你本机这个 Skill 的安装根目录（例如 `~/.claude/skills/ai-collaboration-guard`）。
-这些是 bash 脚本：**Windows 需要 WSL 或 Git Bash**；不同 AI 编程工具对自定义脚本路径的支持本仓库未实测。
+**依赖**：Git、Bash、Python3（解析 PR JSON 用）。`gh` CLI 可选——没有 gh 时 PR 状态标 UNKNOWN，
+你可以引导用户在网页上看 PR。这些是 bash 脚本：**Windows 需要 WSL 或 Git Bash**；
+不同 AI 编程工具对自定义脚本路径的支持、Linux 兼容性本仓库未实测。
 
 `preflight.sh` 只读、不修改任何文件。看输出：
 
@@ -123,8 +145,8 @@ fetch 失败 / 无权限 → 输出 `STATUS: UNKNOWN`，**不是**"对方没改"
 要安全同步（会先保护本地改动再拉远端；默认只快进，分叉时不替你 rebase）：
 
 ```bash
-bash <skill>/scripts/safe_sync.sh              # 真的执行
-bash <skill>/scripts/safe_sync.sh --dry-run    # 只看会做什么，不动手
+bash "$SKILL_DIR/scripts/safe_sync.sh"              # 真的执行
+bash "$SKILL_DIR/scripts/safe_sync.sh" --dry-run    # 只看会做什么，不联网、不动手
 ```
 
 ## 环境还没装好？

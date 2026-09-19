@@ -1,0 +1,18 @@
+name: skill-tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run collaboration regression suite
+        run: bash tests/regression.sh
+      - name: Run independent acceptance probes
+        run: python3 tests/independent_probes.py .

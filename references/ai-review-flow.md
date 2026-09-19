@@ -19,10 +19,12 @@
 | ① 开工前 | `remote_check.sh` + `preflight.sh`；确认本地主线是最新的 | 别在旧基线上干活，回头合不上 |
 | ② 推送前 | `remote_check.sh`；看远端主线有没有新提交 | 有新的就先合进功能分支再推 |
 | ③ 发起 PR 前 | `remote_check.sh` + 你自己读一遍 diff（见第三节） | PR 描述要写清改了啥、为什么、测了啥 |
-| ④ 对方 PR 要合入前 | **重新** `remote_check.sh`；重新读最新 diff；看 checks/review 状态 | PR 可能又有新 push，旧 approve 已失效 |
+| ④ 对方 PR 要合入前 | **重新** `remote_check.sh`；重新读最新 diff；看 checks/review 状态 | PR 可能又有新 push，旧 approve 已不可信 |
 
 > 注意 ④：**合并前必须重查**。你十分钟前看过的 PR，如果对方又推了一个 commit，
-> 旧的 approve 自动失效，你必须重新读新 diff。不要因为"上次看过了"就直接合。
+> 你必须重新读新 diff。这里要区分两件事：
+> - **Skill 要求你重审**（我们这套流程的规矩）：无论 GitHub 有没有自动 dismiss，你都该重看新 diff。
+> - **GitHub 真的自动失效旧 approve**：只有仓库 settings 里开了 "Dismiss stale pull request approvals when new commits are pushed" 才会自动发生。没开这个规则，旧 approve 在 GitHub 上还挂着，但**内容已经过时**——你不能拿它当"已审过"的依据。
 
 ---
 
@@ -51,15 +53,18 @@
 ## 三、语义审查义务（你必须自己做，并留下依据）
 
 机械检查只能告诉你"文件重叠了"。**文件重叠 ≠ 文本冲突**，**文本合并成功 ≠ 逻辑正确**。
-下面这些判断必须由你这个 AI 实际读 diff 来做，并在 PR 描述或回复里写一句依据：
+下面这些判断必须由你这个 AI 实际读 diff 来做，并在 PR 描述或回复里写一句依据。
 
 ### 3.1 改动范围检查
 
-对确定的 base 和 head：
+对确定的 base 和 head，用 **merge-base...head**（三点）来看"feature 真正引入的改动"，
+而不是 `tip..tip`（两点会把 base 自己的新提交也算进来）：
 
 ```bash
-git diff --stat <base>..<head>       # 改了哪些文件、各改了多少行
-git diff --name-only <base>..<head>  # 只列文件名
+# base/head 已从本次 PR/API 核验并解析为完整 SHA；不是随意猜测的 origin/main。
+git diff --stat "$base...$head"
+git diff --name-only "$base...$head"
+git diff --no-ext-diff --no-textconv "$base...$head"
 ```
 
 找**重叠文件**：你这次改了哪些文件，对方 PR 又改了哪些文件，有没有交叠。
@@ -67,26 +72,17 @@ git diff --name-only <base>..<head>  # 只列文件名
 
 ### 3.2 真正的文本冲突预判
 
-不要在用户的工作目录里直接试合（那会污染他的工作区）。
-在**临时目录**里 clone / worktree 出来试：
+不要在用户工作目录中试合，也不要直接在继承任意 Git 配置的环境调用 merge-tree。
 
 ```bash
-# 在 mktemp -d 的目录里
-git clone <repo> trial
-cd trial
-git fetch origin <feature-branch>
-git checkout <feature-branch>
-git merge --no-commit --no-ff origin/main   # 试合，不真提交
-# 看有没有冲突；看完 git merge --abort
+# SKILL_DIR 为已核验的安装绝对路径；base/head 为本次审核解析的完整提交 SHA。
+bash "$SKILL_DIR/scripts/conflict_check.sh" "$base" "$head"
 ```
 
-或者用 `git merge-tree`（不碰工作区）：
-
-```bash
-git merge-tree $(git merge-base origin/main origin/<feature>) origin/main origin/<feature>
-```
-
-输出里有冲突标记就说明真会冲突。
+脚本在临时 Git 副本中使用标准 merge-tree：0=CLEAN、1=CONFLICT、2=UNKNOWN/LIMITED。
+Git <2.38、特殊 merge 属性或信息不足时停止，不通过 checkout 自动降级。
+CLEAN 不代表逻辑、测试或正式批准通过；LIMITED 即便没有发现文本冲突也不能放行。
+检查的是已提交对象，不包含未提交文件。相关双方功能分支应另外两两预演，不能只各自对主线检查。
 
 ### 3.3 逻辑 / 接口 / 数据迁移 / 测试影响
 
@@ -126,9 +122,10 @@ git merge-tree $(git merge-base origin/main origin/<feature>) origin/main origin
 
 ### 4.2 不能做的事
 
-- **不能**作者自审冒充独立批准（同一个账号给自己 PR 点 approve 走流程可以，但要在 PR 里明说"这是作者自审，还需要对方看过"）。
+- **不能**作者给自己的 PR 正式 approve。GitHub 不允许作者对自己的 PR 点正式 Approve（界面上点不了，或点了不算数）。作者可以**评论**说明自检结论，但这不构成对方批准。
 - **不能**借别人的凭证 / token 去点 approve。
 - **不能**用两个 AI 会话假装是两个独立审批人。两个会话都是你这边的，不算独立审查。
+- **不能**把"我自己看了一遍"包装成"对方已审"。
 
 ### 4.3 给小白用户的是什么
 
@@ -146,8 +143,11 @@ git merge-tree $(git merge-base origin/main origin/<feature>) origin/main origin
 
 这是最容易翻车的地方。记住：
 
-1. 你十分钟前看过 PR，对方又 push 了一个 commit → **旧 approve 失效，必须重审新 diff**。
-2. 你点 merge 之前，**再跑一次 `remote_check.sh`**，确认 base 和 head 都还是你看过的那个。
+1. 你十分钟前看过 PR，对方又 push 了一个 commit → **你必须重新读新 diff**。
+   旧 approve 在 GitHub 上是否自动消失取决于 settings 里的 "Dismiss stale reviews" 开关；
+   不管它消不消失，**内容已经过时，不能当已审依据**。
+2. 你点 merge 之前，**再跑一次 `remote_check.sh`**，确认 base 和 head 的 SHA 都还是你看过的那个。
+   remote_check 会打印 `BASE: <sha>` 和 `HEAD: <sha>`，和你上次记的对一下；变了就标 stale、重审。
 3. 不要无条件自动 merge / 部署。合并动作前最后问一句："我看了最新的 diff 和 CI 状态，可以合了吗？"
 
 ---
