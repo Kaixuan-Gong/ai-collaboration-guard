@@ -33,17 +33,33 @@
 
 真实情况：正常 push 用的是"快进"规则。当远端已经有你本地没有的提交时，Git **默认拒绝**你的 push
 （报 `non-fast-forward` 或 `! [rejected] main -> main (fetch first)`），这是它在**保护远端历史不被你悄悄覆盖**。
+**注意：这次拒绝不会删你本地已经有的提交**——你本地的提交还在，只是这次 push 没上去。
 
 正确做法（按顺序）：
 
 ```bash
 git fetch origin          # 把远端最新拉下来，但不自动合并
 git status                # 看清楚你本地领先/落后多少
-# 二选一：
-git pull --rebase origin <你的分支>   # 把你本地的新提交"接在"远端后面，历史更干净（推荐）
-# 或者
-git pull --no-rebase origin <你的分支> # 生成一个合并提交，适合新手
 ```
+
+然后分情况：
+
+- **你本地没有新提交**（只落后）：直接快进合并，最安全：
+
+  ```bash
+  git merge --ff-only origin/<你的分支>
+  ```
+
+- **你本地也有新提交**（分叉了）：**不要替用户选**。停下来，告诉用户两个选项：
+
+  ```bash
+  # A) 经审核后做普通合并（共享分支推荐）：
+  git merge --no-rebase origin/<你的分支>
+  # B) 只在"这个分支只有你一个人在用、没人基于它干活"时才 rebase：
+  git rebase origin/<你的分支>
+  ```
+
+  选 B 之后下次 push 必须 `git push --force-with-lease`（不是 `--force`），且要先和协作者说清楚。
 
 解决完冲突（见 conflict-resolution.md），**正常 push**：
 
@@ -63,11 +79,13 @@ git push origin <你的分支>
 
 正确处理（让用户选，不要替他选）：
 
-- **继续手上的活** → `git add -p && git commit -m "..."` 先存个档。
-- **现在不想提交，想先同步远端** → `git stash push -m "WIP 提示"`，同步完再 `git stash pop`。
-- **放弃手上的活** → 必须用户明确说"不要了"，并先 `git stash` 备份一份再清，不要直接删。
+- **继续手上的活** → 先 `git status` + `git diff` 看一眼改了啥，确认没把 `.env` / 密钥纳进来，然后**按显式路径** `git add path1 path2 && git commit -m "..."` 存个档。
+- **现在不想提交，想先同步远端** → `git stash push -m "<你的名字> WIP: 一句说明"`。**别**用默认的 `git stash push`（没名字以后分不清）；有新文件要一起收才加 `-u`（`git stash push -u -m "..."`），但 `-u` 会连未跟踪文件一起收，确认里面没有 `.env` / secrets。
+  同步完先 `git stash list` 找到你那条，`git stash show -p stash@{n}` 看一眼内容确认是自己的活，再 `git stash pop stash@{n}`。**别**光 `git stash pop`——默认弹最新一条，可能弹到别人的活。
+- **放弃手上的活** → 必须用户明确说"不要了"，并先 `git stash push -m "你的名字 备份待删"` 存一份再清，不要直接删。
 
 `git stash` 是安全网：它把未提交改动收起来，工作区变干净；`git stash pop` 再放回来。
+**但它不是自动保护**：本 Skill 的脚本（preflight / safe_sync）**不会**自动替你 stash，只会停下提醒你。stash 什么、什么时候 pop，由你决定。
 
 ## 四、敏感信息与 .gitignore
 
@@ -90,10 +108,13 @@ git push origin <你的分支>
 **能做到什么、做不到什么，如实说，不要美化：**
 
 - **分支保护规则**（禁止直接推主分支、要求 PR、要求必过检查）：只有仓库 **owner** 能在
-  GitHub 网页 `Settings → Branches → Branch protection rules` 里设置。免费账号的公开仓库**可以**用基本的分支保护，
-  但"要求 reviewer 批准""要求 status checks 通过"在某些私有仓库/计划上才有。先去设置页看得到什么，就说什么。
+  GitHub 网页 `Settings → Branches → Branch protection rules` 里设置（也可以用 CLI / API 设）。
+  设完**一定要回到这个页面回读一遍**，确认规则真的生效了，不要假设"设了就一定拦得住"。
+  免费账号的公开仓库**可以**用基本的分支保护，但"要求 reviewer 批准""要求 status checks 通过"在某些私有仓库/计划上才有。
+  先去设置页看得到什么，就说什么；看不到的功能不要假装有。
 - **PR 互相 review**：真实两个 GitHub 账号时，互相 review 是有意义的。**同一个账号给自己 PR 点 approve**
   不算真审查——可以用来走流程，但要告诉用户"这是你自己审自己，对方最好也点进来看看"。
+  另外：**新 push 一个 commit 会让旧的 approve 失效**，不要指望上次点过的 approve 一直有效。
 - **CI 自动检查**：如果加了 GitHub Actions，**必须确认它真的会跑、真的会变绿**：
   - 不要写一个 `paths: [ 'src/only-changed-by-nobody/' ]` 这种永远不触发的过滤，否则 PR 永远卡在 pending。
   - 不要把"要求必过"套在一个根本跑不起来的 workflow 上，那样谁都合不进去。
